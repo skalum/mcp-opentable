@@ -4,7 +4,7 @@
  * Playwright-based automation for OpenTable reservation operations.
  */
 
-import { chromium, Browser, BrowserContext, Page } from "playwright";
+import { chromium, Browser, BrowserContext, Page } from "patchright";
 import { saveCookies, loadCookies, getAuthState, AuthState } from "./auth.js";
 
 const OPENTABLE_BASE_URL = "https://www.opentable.com";
@@ -56,37 +56,24 @@ export interface Reservation {
 }
 
 /**
- * Initialize browser with stealth settings
+ * Initialize browser.
+ *
+ * OpenTable's edge (Akamai) resets connections from headless browsers
+ * outright, so this must run a real, headed Chrome. Patchright supplies the
+ * stealth patches — do not add a custom user agent or init scripts, they
+ * break its cover.
  */
 async function initBrowser(): Promise<void> {
   if (browser) return;
 
   browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-    ],
+    headless: false,
+    channel: "chrome",
   });
 
   context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     viewport: { width: 1280, height: 800 },
     locale: "en-US",
-    extraHTTPHeaders: {
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
-
-  // Apply stealth patches
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    Object.defineProperty(navigator, "plugins", {
-      get: () => [1, 2, 3, 4, 5],
-    });
   });
 
   // Load saved cookies
@@ -137,18 +124,184 @@ export async function checkAuth(): Promise<AuthState> {
   return authState;
 }
 
+export function hasLoginEmail(): boolean {
+  return !!process.env.OPENTABLE_EMAIL;
+}
+
 /**
- * Return login URL and instructions for the user to authenticate
+ * Find the sign-in modal's iframe on the current page
  */
-export async function getLoginUrl(): Promise<{
-  url: string;
-  instructions: string;
+function findAuthFrame(p: Page, urlPart = "/authenticate/") {
+  return p.frames().find((f) => f.url().includes(urlPart));
+}
+
+/**
+ * Start the OpenTable email login flow: open the sign-in modal, choose
+ * "Use email instead", and submit OPENTABLE_EMAIL. OpenTable then emails a
+ * one-time verification code (there is no password login). The flow stays
+ * open on the code-entry step until submitLoginCode() completes it.
+ */
+export async function requestLoginCode(): Promise<{
+  success: boolean;
+  message?: string;
+  error?: string;
 }> {
-  const loginUrl = `${OPENTABLE_BASE_URL}/login`;
+  const email = process.env.OPENTABLE_EMAIL;
+  if (!email) {
+    return {
+      success: false,
+      error:
+        "OPENTABLE_EMAIL is not set. Add it to the MCP server config to enable login.",
+    };
+  }
+
+  const p = await getPage();
+
+  try {
+    await p.goto(OPENTABLE_BASE_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: DEFAULT_TIMEOUT,
+    });
+    await p.waitForTimeout(2000);
+
+    await p.locator('[data-test="header-sign-in-button"]').first().click();
+
+    let frame = findAuthFrame(p);
+    for (let i = 0; i < 20 && !frame; i++) {
+      await p.waitForTimeout(500);
+      frame = findAuthFrame(p);
+    }
+    if (!frame) {
+      throw new Error("Sign-in dialog did not appear");
+    }
+
+    // The modal defaults to phone login; switch to email
+    const emailButton = frame.locator(
+      '[data-test="continue-with-email-button"]'
+    );
+    await emailButton.waitFor({ timeout: 10000 });
+    await emailButton.click();
+
+    const emailField = frame.locator('input[type="email"], #email').first();
+    await emailField.waitFor({ timeout: 10000 });
+    await emailField.fill(email);
+    await frame.locator('[data-test="continue-button"]').first().click();
+
+    // Wait for the verification-code step
+    let verifyFrame = null;
+    for (let i = 0; i < 20 && !verifyFrame; i++) {
+      await p.waitForTimeout(500);
+      verifyFrame = findAuthFrame(p, "verify-medium");
+    }
+    if (!verifyFrame) {
+      const text =
+        (await frame.locator("body").textContent().catch(() => "")) || "";
+      const hint = /captcha|not a robot/i.test(text)
+        ? " A CAPTCHA appears to be blocking the flow."
+        : "";
+      throw new Error(`Did not reach the verification-code step.${hint}`);
+    }
+
+    return {
+      success: true,
+      message: `OpenTable sent a verification code to ${email}. Get the code from that inbox and call opentable_submit_code with it to finish logging in.`,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error:
+        error instanceof Error ? error.message : "Failed to request login code",
+    };
+  }
+}
+
+/**
+ * Complete a login started by requestLoginCode() using the emailed code
+ */
+export async function submitLoginCode(code: string): Promise<{
+  success: boolean;
+  message?: string;
+  error?: string;
+}> {
+  const p = await getPage();
+  const ctx = await getContext();
+
+  const frame = findAuthFrame(p, "verify-medium");
+  if (!frame) {
+    return {
+      success: false,
+      error:
+        "No login in progress. Call opentable_login first to request a verification code.",
+    };
+  }
+
+  try {
+    await frame.locator("#emailVerificationCode").fill(code.trim());
+    await frame.locator('button:has-text("Continue")').first().click();
+    await p.waitForTimeout(5000);
+
+    const authState = await getAuthState(ctx);
+    if (authState.isLoggedIn) {
+      await saveCookies(ctx);
+      return {
+        success: true,
+        message:
+          "Logged in to OpenTable. The session is saved and will persist across restarts.",
+      };
+    }
+
+    const text =
+      (await frame.locator("body").textContent().catch(() => "")) || "";
+    if (/invalid|incorrect|expired/i.test(text)) {
+      return {
+        success: false,
+        error:
+          "OpenTable rejected the code (invalid or expired). Call opentable_login to request a new one.",
+      };
+    }
+    return {
+      success: false,
+      error: "Code was submitted but no logged-in session was created.",
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error:
+        error instanceof Error ? error.message : "Failed to submit login code",
+    };
+  }
+}
+
+/**
+ * Ensure there is a logged-in session. If there isn't one and
+ * OPENTABLE_EMAIL is configured, kicks off the code flow so the caller can
+ * relay the emailed verification code via opentable_submit_code.
+ */
+export async function ensureLoggedIn(): Promise<{
+  loggedIn: boolean;
+  error?: string;
+}> {
+  const ctx = await getContext();
+  const authState = await getAuthState(ctx);
+  if (authState.isLoggedIn) {
+    return { loggedIn: true };
+  }
+
+  if (!hasLoginEmail()) {
+    return {
+      loggedIn: false,
+      error:
+        "Not logged in to OpenTable. Set OPENTABLE_EMAIL in the MCP server config, then use the opentable_login tool.",
+    };
+  }
+
+  const request = await requestLoginCode();
+  if (request.success) {
+    return { loggedIn: false, error: request.message };
+  }
   return {
-    url: loginUrl,
-    instructions:
-      "Please log in to OpenTable in your browser. After logging in, run the 'opentable_status' tool to verify authentication and save your session. Your session will be stored in ~/.strider/opentable/cookies.json.",
+    loggedIn: false,
+    error: `Not logged in, and requesting a login code failed: ${request.error}`,
   };
 }
 
@@ -553,6 +706,14 @@ export async function makeReservation(params: {
       confirm,
     } = params;
 
+    // Booking requires an authenticated session; previews don't
+    if (confirm) {
+      const auth = await ensureLoggedIn();
+      if (!auth.loggedIn) {
+        return { success: false, error: auth.error };
+      }
+    }
+
     const url = restaurantId.startsWith("http")
       ? restaurantId
       : `${OPENTABLE_BASE_URL}/restaurant/${restaurantId}`;
@@ -681,6 +842,11 @@ export async function getReservations(): Promise<{
   const ctx = await getContext();
 
   try {
+    const auth = await ensureLoggedIn();
+    if (!auth.loggedIn) {
+      return { success: false, error: auth.error };
+    }
+
     await p.goto(`${OPENTABLE_BASE_URL}/account/reservations`, {
       waitUntil: "domcontentloaded",
       timeout: DEFAULT_TIMEOUT,
@@ -810,6 +976,11 @@ export async function cancelReservation(params: {
         requiresConfirmation: true,
         message: `Please confirm cancellation of reservation ${reservationId}. Set confirm=true to proceed.`,
       };
+    }
+
+    const auth = await ensureLoggedIn();
+    if (!auth.loggedIn) {
+      return { success: false, error: auth.error };
     }
 
     // Navigate to the reservation page
