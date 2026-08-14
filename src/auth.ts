@@ -7,7 +7,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import type { BrowserContext, Cookie } from "playwright";
+import type { BrowserContext, Cookie } from "patchright";
 
 // Cookie storage location: ~/.strider/opentable/
 const CONFIG_DIR = join(homedir(), ".strider", "opentable");
@@ -93,14 +93,10 @@ export function hasStoredCookies(): boolean {
 export async function getAuthState(context: BrowserContext): Promise<AuthState> {
   const cookies = await context.cookies("https://www.opentable.com");
 
-  // OpenTable uses various session/auth cookies
+  // authCke/uCke are only present for logged-in sessions; the various
+  // OT-SessionId cookies exist for anonymous visitors too
   const sessionCookie = cookies.find(
-    (c) =>
-      c.name === "OT_SESSION" ||
-      c.name === "ot_session" ||
-      c.name === "otd" ||
-      c.name === "OTUserInfo" ||
-      c.name === "ot_userid"
+    (c) => c.name === "authCke" || c.name === "uCke"
   );
 
   if (sessionCookie) {

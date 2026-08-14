@@ -44,12 +44,34 @@ export interface Reservation {
  * Check if user is logged in to OpenTable
  */
 export declare function checkAuth(): Promise<AuthState>;
+export declare function hasLoginEmail(): boolean;
 /**
- * Return login URL and instructions for the user to authenticate
+ * Start the OpenTable email login flow: open the sign-in modal, choose
+ * "Use email instead", and submit OPENTABLE_EMAIL. OpenTable then emails a
+ * one-time verification code (there is no password login). The flow stays
+ * open on the code-entry step until submitLoginCode() completes it.
  */
-export declare function getLoginUrl(): Promise<{
-    url: string;
-    instructions: string;
+export declare function requestLoginCode(): Promise<{
+    success: boolean;
+    message?: string;
+    error?: string;
+}>;
+/**
+ * Complete a login started by requestLoginCode() using the emailed code
+ */
+export declare function submitLoginCode(code: string): Promise<{
+    success: boolean;
+    message?: string;
+    error?: string;
+}>;
+/**
+ * Ensure there is a logged-in session. If there isn't one and
+ * OPENTABLE_EMAIL is configured, kicks off the code flow so the caller can
+ * relay the emailed verification code via opentable_submit_code.
+ */
+export declare function ensureLoggedIn(): Promise<{
+    loggedIn: boolean;
+    error?: string;
 }>;
 /**
  * Search restaurants on OpenTable

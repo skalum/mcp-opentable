@@ -16,7 +16,9 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import {
   checkAuth,
-  getLoginUrl,
+  hasLoginEmail,
+  requestLoginCode,
+  submitLoginCode,
   searchRestaurants,
   getRestaurantDetails,
   checkAvailability,
@@ -56,10 +58,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "opentable_login",
         description:
-          "Get the OpenTable login URL and instructions for the user to authenticate. Use this when opentable_status returns not logged in.",
+          "Start the OpenTable login flow: has OpenTable email a one-time verification code to the configured OPENTABLE_EMAIL address (OpenTable has no password login). Ask the user for the code from their inbox, then call opentable_submit_code to finish. Use this when opentable_status returns not logged in.",
         inputSchema: {
           type: "object",
           properties: {},
+        },
+      },
+      {
+        name: "opentable_submit_code",
+        description:
+          "Finish an OpenTable login started with opentable_login by submitting the verification code that was emailed to the user.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            code: {
+              type: "string",
+              description: "The verification code from the email OpenTable sent",
+            },
+          },
+          required: ["code"],
         },
       },
       {
@@ -227,40 +244,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "opentable_status": {
         const hasCookies = hasStoredCookies();
+        const authState = hasCookies
+          ? await checkAuth()
+          : { isLoggedIn: false };
 
-        if (!hasCookies) {
-          const loginInfo = await getLoginUrl();
+        if (authState.isLoggedIn) {
           return {
             content: [
               {
                 type: "text",
                 text: JSON.stringify({
                   success: true,
-                  isLoggedIn: false,
-                  message: "Not logged in to OpenTable.",
-                  loginUrl: loginInfo.url,
-                  instructions: loginInfo.instructions,
-                  cookiesPath: getCookiesPath(),
-                }),
-              },
-            ],
-          };
-        }
-
-        const authState = await checkAuth();
-
-        if (!authState.isLoggedIn) {
-          const loginInfo = await getLoginUrl();
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify({
-                  success: true,
-                  isLoggedIn: false,
-                  message: "Session expired or invalid. Please log in again.",
-                  loginUrl: loginInfo.url,
-                  instructions: loginInfo.instructions,
+                  isLoggedIn: true,
+                  message: "Logged in to OpenTable.",
                 }),
               },
             ],
@@ -273,9 +269,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               type: "text",
               text: JSON.stringify({
                 success: true,
-                isLoggedIn: true,
-                message: "Logged in to OpenTable.",
-                email: authState.email,
+                isLoggedIn: false,
+                message: hasCookies
+                  ? "Session expired or invalid."
+                  : "Not logged in to OpenTable.",
+                instructions: hasLoginEmail()
+                  ? "Call opentable_login to have a verification code emailed, then opentable_submit_code with the code from the inbox."
+                  : "Set OPENTABLE_EMAIL in the MCP server config, then call opentable_login.",
+                cookiesPath: getCookiesPath(),
               }),
             },
           ],
@@ -283,19 +284,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "opentable_login": {
-        const loginInfo = await getLoginUrl();
+        const result = await requestLoginCode();
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify({
-                success: true,
-                loginUrl: loginInfo.url,
-                instructions: loginInfo.instructions,
-                cookiesPath: getCookiesPath(),
-              }),
+              text: JSON.stringify(result),
             },
           ],
+          isError: !result.success,
+        };
+      }
+
+      case "opentable_submit_code": {
+        const { code } = args as { code: string };
+        const result = await submitLoginCode(code);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result),
+            },
+          ],
+          isError: !result.success,
         };
       }
 

@@ -135,13 +135,54 @@ reservations = get_my_reservations()
 
 ## Configuration
 
-### Environment Variables
+### Login
+
+OpenTable has no password login — signing in emails a one-time verification
+code. Set `OPENTABLE_EMAIL` and the server handles the rest of the flow:
+
+1. `opentable_login` (called explicitly, or automatically when a booking
+   tool needs an authenticated session) opens OpenTable's sign-in flow and
+   requests a code for `OPENTABLE_EMAIL`.
+2. The agent asks you for the code from your inbox and passes it to
+   `opentable_submit_code`, which completes the login.
+3. Session cookies are saved to `~/.strider/opentable/cookies.json` and
+   reused across restarts, so this only recurs when the session expires.
+
+In Claude Desktop, set the variable via the `env` block of the server config:
+
+```json
+{
+  "mcpServers": {
+    "opentable": {
+      "command": "npx",
+      "args": ["-y", "@striderlabs/mcp-opentable"],
+      "env": {
+        "OPENTABLE_EMAIL": "your-email@example.com"
+      }
+    }
+  }
+}
+```
+
+For first-time setup you can also log in from a terminal instead of through
+the agent:
 
 ```bash
-# Optional: Use a specific OpenTable account
-OPENTABLE_EMAIL=your-email@example.com
-OPENTABLE_PASSWORD=your-password  # Highly recommend using .env file
+OPENTABLE_EMAIL=your-email@example.com node scripts/login.mjs
+# enter the emailed code at the prompt
 ```
+
+### Browser requirements
+
+OpenTable blocks headless browsers at the network edge, so this server
+drives a real, visible Google Chrome window (via
+[patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright)):
+
+- **Google Chrome must be installed** on the machine running the server.
+- A display is required. On a desktop macOS/Windows/Linux machine this just
+  works (a Chrome window appears briefly during operations). On a headless
+  Linux server, run under a virtual display, e.g.
+  `xvfb-run -a npx @striderlabs/mcp-opentable`.
 
 ### Self-Hosted
 

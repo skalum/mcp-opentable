@@ -74,12 +74,9 @@ export function hasStoredCookies() {
  */
 export async function getAuthState(context) {
     const cookies = await context.cookies("https://www.opentable.com");
-    // OpenTable uses various session/auth cookies
-    const sessionCookie = cookies.find((c) => c.name === "OT_SESSION" ||
-        c.name === "ot_session" ||
-        c.name === "otd" ||
-        c.name === "OTUserInfo" ||
-        c.name === "ot_userid");
+    // authCke/uCke are only present for logged-in sessions; the various
+    // OT-SessionId cookies exist for anonymous visitors too
+    const sessionCookie = cookies.find((c) => c.name === "authCke" || c.name === "uCke");
     if (sessionCookie) {
         return {
             isLoggedIn: true,
