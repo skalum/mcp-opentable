@@ -19,6 +19,8 @@ import {
   hasLoginEmail,
   requestLoginCode,
   submitLoginCode,
+  checkModifyAvailability,
+  modifyReservation,
   searchRestaurants,
   getRestaurantDetails,
   checkAvailability,
@@ -140,13 +142,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "opentable_check_availability",
         description:
-          "Check available reservation time slots for a restaurant on a specific date and party size.",
+          "Check available reservation time slots for a restaurant on a specific date and party size. Optionally filter to a time window (e.g. only slots between 17:00 and 19:30) — useful when watching for a specific time to open up.",
         inputSchema: {
           type: "object",
           properties: {
             restaurantId: {
               type: "string",
-              description: "The restaurant ID or profile URL",
+              description:
+                "The restaurant ID (numeric rid), slug, or profile URL (from search results)",
             },
             date: {
               type: "string",
@@ -160,6 +163,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             partySize: {
               type: "number",
               description: "Number of guests",
+            },
+            earliestTime: {
+              type: "string",
+              description:
+                "Optional: only return slots at or after this time (HH:MM)",
+            },
+            latestTime: {
+              type: "string",
+              description:
+                "Optional: only return slots at or before this time (HH:MM)",
             },
           },
           required: ["restaurantId", "date", "time", "partySize"],
@@ -203,9 +216,73 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "opentable_check_modify_availability",
+        description:
+          "Check what alternative times are available for an EXISTING reservation via OpenTable's modify flow (same date). Use this — not opentable_check_availability — when looking to move an existing reservation: the modify flow often offers times the new-reservation flow does not. Optionally filter to a time window.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            reservationUrl: {
+              type: "string",
+              description:
+                "The reservation's manageUrl from opentable_get_reservations",
+            },
+            time: {
+              type: "string",
+              description:
+                "Desired time in HH:MM (24h) to anchor the search (e.g. '18:00')",
+            },
+            partySize: {
+              type: "number",
+              description: "Optional: change party size (defaults to current)",
+            },
+            earliestTime: {
+              type: "string",
+              description:
+                "Optional: only return slots at or after this time (HH:MM)",
+            },
+            latestTime: {
+              type: "string",
+              description:
+                "Optional: only return slots at or before this time (HH:MM)",
+            },
+          },
+          required: ["reservationUrl", "time"],
+        },
+      },
+      {
+        name: "opentable_modify_reservation",
+        description:
+          "Move an existing reservation to a new time on the same date via the modify flow. Set confirm=false to preview whether the time is offered, confirm=true to actually move it.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            reservationUrl: {
+              type: "string",
+              description:
+                "The reservation's manageUrl from opentable_get_reservations",
+            },
+            newTime: {
+              type: "string",
+              description: "The new time in HH:MM (24h), e.g. '18:00'",
+            },
+            partySize: {
+              type: "number",
+              description: "Optional: change party size (defaults to current)",
+            },
+            confirm: {
+              type: "boolean",
+              description:
+                "true to actually move the reservation, false to preview",
+            },
+          },
+          required: ["reservationUrl", "newTime", "confirm"],
+        },
+      },
+      {
         name: "opentable_get_reservations",
         description:
-          "List all upcoming reservations for the logged-in user. Requires authentication.",
+          "List all upcoming reservations for the logged-in user, including each reservation's manageUrl (needed for cancellation). Requires authentication.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -221,7 +298,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             reservationId: {
               type: "string",
               description:
-                "The reservation ID to cancel (from opentable_get_reservations)",
+                "The reservation's manageUrl from opentable_get_reservations (a /booking/view?... path)",
             },
             confirm: {
               type: "boolean",
@@ -369,17 +446,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "opentable_check_availability": {
-        const { restaurantId, date, time, partySize } = args as {
-          restaurantId: string;
-          date: string;
-          time: string;
-          partySize: number;
-        };
+        const { restaurantId, date, time, partySize, earliestTime, latestTime } =
+          args as {
+            restaurantId: string;
+            date: string;
+            time: string;
+            partySize: number;
+            earliestTime?: string;
+            latestTime?: string;
+          };
         const result = await checkAvailability({
           restaurantId,
           date,
           time,
           partySize,
+          earliestTime,
+          latestTime,
         });
 
         return {
@@ -425,6 +507,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               text: JSON.stringify(result),
             },
           ],
+          isError: !result.success,
+        };
+      }
+
+      case "opentable_check_modify_availability": {
+        const { reservationUrl, time, partySize, earliestTime, latestTime } =
+          args as {
+            reservationUrl: string;
+            time: string;
+            partySize?: number;
+            earliestTime?: string;
+            latestTime?: string;
+          };
+        const result = await checkModifyAvailability({
+          reservationUrl,
+          time,
+          partySize,
+          earliestTime,
+          latestTime,
+        });
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(result) }],
+          isError: !result.success,
+        };
+      }
+
+      case "opentable_modify_reservation": {
+        const { reservationUrl, newTime, partySize, confirm } = args as {
+          reservationUrl: string;
+          newTime: string;
+          partySize?: number;
+          confirm: boolean;
+        };
+        const result = await modifyReservation({
+          reservationUrl,
+          newTime,
+          partySize,
+          confirm,
+        });
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(result) }],
           isError: !result.success,
         };
       }

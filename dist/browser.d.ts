@@ -39,6 +39,7 @@ export interface Reservation {
     status: string;
     confirmationNumber?: string;
     specialRequests?: string;
+    manageUrl?: string;
 }
 /**
  * Check if user is logged in to OpenTable
@@ -103,10 +104,13 @@ export declare function checkAvailability(params: {
     date: string;
     time: string;
     partySize: number;
+    earliestTime?: string;
+    latestTime?: string;
 }): Promise<{
     success: boolean;
     slots?: AvailabilitySlot[];
     restaurantName?: string;
+    message?: string;
     error?: string;
 }>;
 /**
@@ -154,6 +158,39 @@ export declare function cancelReservation(params: {
     success: boolean;
     requiresConfirmation?: boolean;
     message?: string;
+    error?: string;
+}>;
+/**
+ * Check what times the modify flow offers for an existing reservation
+ */
+export declare function checkModifyAvailability(params: {
+    reservationUrl: string;
+    time: string;
+    partySize?: number;
+    earliestTime?: string;
+    latestTime?: string;
+}): Promise<{
+    success: boolean;
+    currentReservation?: string;
+    slots?: string[];
+    allOffered?: string[];
+    error?: string;
+}>;
+/**
+ * Modify an existing reservation to a new time (same date) via the modify
+ * flow. With confirm=false, previews the offered times without changing
+ * anything.
+ */
+export declare function modifyReservation(params: {
+    reservationUrl: string;
+    newTime: string;
+    partySize?: number;
+    confirm: boolean;
+}): Promise<{
+    success: boolean;
+    requiresConfirmation?: boolean;
+    message?: string;
+    offeredTimes?: string[];
     error?: string;
 }>;
 /**

@@ -10,6 +10,35 @@ import { saveCookies, loadCookies, getAuthState, AuthState } from "./auth.js";
 const OPENTABLE_BASE_URL = "https://www.opentable.com";
 const DEFAULT_TIMEOUT = 30000;
 
+/**
+ * Build a restaurant page URL. Accepts a full URL, a numeric rid
+ * (/restaurant/profile/<rid>), or a slug (/r/<slug>).
+ */
+function restaurantUrl(restaurantId: string): string {
+  if (restaurantId.startsWith("http")) return restaurantId;
+  if (/^\d+$/.test(restaurantId)) {
+    return `${OPENTABLE_BASE_URL}/restaurant/profile/${restaurantId}`;
+  }
+  return `${OPENTABLE_BASE_URL}/r/${restaurantId}`;
+}
+
+/**
+ * Parse "5:00 PM" or "17:00" to minutes since midnight; null if unparseable
+ */
+function timeToMinutes(t: string): number | null {
+  const ampm = t.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (ampm) {
+    let h = parseInt(ampm[1]) % 12;
+    if (/pm/i.test(ampm[3])) h += 12;
+    return h * 60 + parseInt(ampm[2]);
+  }
+  const h24 = t.trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (h24) {
+    return parseInt(h24[1]) * 60 + parseInt(h24[2]);
+  }
+  return null;
+}
+
 // Singleton browser instance
 let browser: Browser | null = null;
 let context: BrowserContext | null = null;
@@ -53,6 +82,7 @@ export interface Reservation {
   status: string;
   confirmationNumber?: string;
   specialRequests?: string;
+  manageUrl?: string;
 }
 
 /**
@@ -335,102 +365,65 @@ export async function searchRestaurants(params: {
     });
     await p.waitForTimeout(3000);
 
-    // Wait for restaurant results
     await p
-      .locator(
-        '[data-test="search-result"], [data-testid="restaurant-card"], article[data-restaurant-id]'
-      )
+      .locator('[data-test="restaurant-card"]')
       .first()
       .waitFor({ timeout: 10000 })
       .catch(() => {});
 
-    const restaurants: Restaurant[] = [];
-
-    // Extract restaurant cards
-    const cards = p.locator(
-      '[data-test="search-result"], [data-testid="restaurant-card"], [data-restaurant-id]'
-    );
-    const cardCount = await cards.count();
-
-    for (let i = 0; i < Math.min(cardCount, 20); i++) {
-      const card = cards.nth(i);
-
-      try {
-        const name =
-          (await card
-            .locator('h2, h3, [data-test="restaurant-name"], a[data-ot-track-component="Restaurant Name"]')
-            .first()
-            .textContent()
-            .catch(() => "")) || "";
-
-        const cuisineText =
-          (await card
-            .locator('[data-test="cuisine"], span:has-text("Cuisine")')
-            .first()
-            .textContent()
-            .catch(() => "")) || "";
-
-        const neighborhoodText =
-          (await card
-            .locator('[data-test="neighborhood"], [data-testid="neighborhood"]')
-            .first()
-            .textContent()
-            .catch(() => "")) || "";
-
-        const ratingText =
-          (await card
-            .locator('[data-test="rating"], [aria-label*="rating"]')
-            .first()
-            .textContent()
-            .catch(() => "")) || "";
-
-        const reviewCountText =
-          (await card
-            .locator('[data-test="review-count"], span:has-text("reviews")')
-            .first()
-            .textContent()
-            .catch(() => "")) || "";
-
-        const priceRange =
-          (await card
-            .locator('[data-test="price"], span:has-text("$")')
-            .first()
-            .textContent()
-            .catch(() => "")) || "";
-
-        // Get profile link and extract restaurant ID
-        const profileLink =
-          (await card
-            .locator("a[href*='/restaurant/']")
-            .first()
-            .getAttribute("href")
-            .catch(() => "")) || "";
-        const ridMatch = profileLink.match(/\/restaurant\/([^/?]+)/);
-        const restaurantId = ridMatch?.[1] || `restaurant-${i}`;
-
-        const restaurantIdAttr =
-          (await card.getAttribute("data-restaurant-id").catch(() => "")) || restaurantId;
-
-        if (name.trim()) {
-          restaurants.push({
-            id: restaurantIdAttr || restaurantId,
-            name: name.trim(),
-            cuisine: cuisineText.trim(),
-            location: neighborhoodText.trim() || location,
-            neighborhood: neighborhoodText.trim(),
-            rating: parseFloat(ratingText.replace(/[^0-9.]/g, "")) || undefined,
-            reviewCount:
-              parseInt(reviewCountText.replace(/[^0-9]/g, "")) || undefined,
-            priceRange: priceRange.trim() || undefined,
-            profileUrl: profileLink
-              ? `${OPENTABLE_BASE_URL}${profileLink}`
-              : undefined,
-          });
-        }
-      } catch {
-        // Skip problematic cards
-      }
+    // Results lazy-render; scroll to flush more cards into the DOM
+    for (let i = 0; i < 3; i++) {
+      await p.mouse.wheel(0, 1500);
+      await p.waitForTimeout(1000);
     }
+
+    const restaurants: Restaurant[] = await p.evaluate((fallbackLocation) => {
+      const cards = Array.from(
+        document.querySelectorAll('[data-test="restaurant-card"]')
+      ).slice(0, 20);
+
+      return cards
+        .map((card, i) => {
+          const link =
+            card.querySelector<HTMLAnchorElement>(
+              'a[data-test^="restaurant-card-profile-link-"]'
+            ) || card.querySelector<HTMLAnchorElement>('a[href*="/r/"]');
+          const name =
+            link
+              ?.getAttribute("aria-label")
+              ?.replace(/^View /, "")
+              .replace(/ restaurant details$/, "") ||
+            card.querySelector("img")?.getAttribute("alt") ||
+            (card.textContent || "").split("\n").map((l) => l.trim())[0] ||
+            "";
+          const rid = card.getAttribute("data-rid") || `restaurant-${i}`;
+
+          // Cuisine / price / neighborhood are unlabeled text; parse them
+          // best-effort from the card's text lines
+          const lines = (card.textContent || "")
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean);
+          const priceLine = lines.find((l) => /^\$+/.test(l)) || "";
+          const ratingMatch = (card.textContent || "").match(
+            /(\d\.\d)\s*\((\d+[\d,]*)\)?/
+          );
+
+          return {
+            id: rid,
+            name,
+            cuisine: "",
+            location: fallbackLocation,
+            rating: ratingMatch ? parseFloat(ratingMatch[1]) : undefined,
+            reviewCount: ratingMatch
+              ? parseInt(ratingMatch[2].replace(/,/g, "")) || undefined
+              : undefined,
+            priceRange: priceLine || undefined,
+            profileUrl: link?.href || undefined,
+          };
+        })
+        .filter((r) => r.name);
+    }, location);
 
     await saveCookies(ctx);
 
@@ -454,9 +447,7 @@ export async function getRestaurantDetails(
   const ctx = await getContext();
 
   try {
-    const url = restaurantId.startsWith("http")
-      ? restaurantId
-      : `${OPENTABLE_BASE_URL}/restaurant/${restaurantId}`;
+    const url = restaurantUrl(restaurantId);
 
     await p.goto(url, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
     await p.waitForTimeout(3000);
@@ -578,82 +569,74 @@ export async function checkAvailability(params: {
   date: string;
   time: string;
   partySize: number;
+  earliestTime?: string;
+  latestTime?: string;
 }): Promise<{
   success: boolean;
   slots?: AvailabilitySlot[];
   restaurantName?: string;
+  message?: string;
   error?: string;
 }> {
   const p = await getPage();
   const ctx = await getContext();
 
   try {
-    const { restaurantId, date, time, partySize } = params;
+    const { restaurantId, date, time, partySize, earliestTime, latestTime } =
+      params;
 
-    // Build restaurant URL with availability params
-    const url = restaurantId.startsWith("http")
-      ? restaurantId
-      : `${OPENTABLE_BASE_URL}/restaurant/${restaurantId}`;
-
-    const fullUrl = `${url}?dateTime=${date}T${time}:00&covers=${partySize}`;
+    const fullUrl = `${restaurantUrl(restaurantId)}?dateTime=${date}T${time}:00&covers=${partySize}`;
     await p.goto(fullUrl, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
     await p.waitForTimeout(3000);
 
     const restaurantName =
-      (await p
-        .locator("h1, [data-test='restaurant-name']")
-        .first()
-        .textContent()
-        .catch(() => "")) || "Unknown Restaurant";
+      (await p.locator("h1").first().textContent().catch(() => "")) ||
+      "Unknown Restaurant";
 
-    // Wait for availability slots to load
+    // Slots render as list items under the "Select a time" module. The page
+    // renders the module more than once (desktop + overlay variants), so
+    // scope to the first list and dedupe.
     await p
-      .locator(
-        '[data-test="availability-time"], [data-testid="time-slot"], button[data-datetime]'
-      )
+      .locator('[data-test="time-slots"] [data-test^="time-slot"]')
       .first()
       .waitFor({ timeout: 10000 })
       .catch(() => {});
 
-    const slots: AvailabilitySlot[] = [];
+    const slotTimes: string[] = [
+      ...new Set(
+        await p
+          .locator('[data-test="time-slots"]')
+          .first()
+          .locator('[data-test^="time-slot"]')
+          .evaluateAll((els) =>
+            els.map((e) => (e.textContent || "").trim()).filter(Boolean)
+          )
+      ),
+    ];
 
-    // Extract available time slots
-    const timeSlots = p.locator(
-      '[data-test="availability-time"], [data-testid="time-slot"], button[data-datetime], [aria-label*="Reserve"]'
-    );
-    const slotCount = await timeSlots.count();
-
-    for (let i = 0; i < Math.min(slotCount, 30); i++) {
-      const slot = timeSlots.nth(i);
-
-      try {
-        const timeText =
-          (await slot.textContent().catch(() => "")) || "";
-        const datetime =
-          (await slot.getAttribute("data-datetime").catch(() => "")) || "";
-        const token =
-          (await slot.getAttribute("data-reservation-token").catch(() => "")) ||
-          undefined;
-
-        if (timeText.trim()) {
-          slots.push({
-            time: timeText.trim(),
-            partySize,
-            date,
-            reservationToken: token,
-          });
-        }
-      } catch {
-        // Skip problematic slots
-      }
-    }
+    const earliest = earliestTime ? timeToMinutes(earliestTime) : null;
+    const latest = latestTime ? timeToMinutes(latestTime) : null;
+    const slots: AvailabilitySlot[] = slotTimes
+      .filter((t) => {
+        const m = timeToMinutes(t);
+        if (m === null) return true;
+        if (earliest !== null && m < earliest) return false;
+        if (latest !== null && m > latest) return false;
+        return true;
+      })
+      .map((t) => ({ time: t, partySize, date }));
 
     await saveCookies(ctx);
 
+    const windowNote =
+      earliest !== null || latest !== null
+        ? ` within the requested window (all offered: ${slotTimes.join(", ") || "none"})`
+        : "";
     return {
       success: true,
       restaurantName: restaurantName.trim(),
       slots,
+      message: `${slots.length} available time slot(s)${windowNote}.`,
     };
   } catch (error) {
     return {
@@ -714,20 +697,13 @@ export async function makeReservation(params: {
       }
     }
 
-    const url = restaurantId.startsWith("http")
-      ? restaurantId
-      : `${OPENTABLE_BASE_URL}/restaurant/${restaurantId}`;
-
-    const fullUrl = `${url}?dateTime=${date}T${time}:00&covers=${partySize}`;
+    const fullUrl = `${restaurantUrl(restaurantId)}?dateTime=${date}T${time}:00&covers=${partySize}`;
     await p.goto(fullUrl, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
     await p.waitForTimeout(3000);
 
     const restaurantName =
-      (await p
-        .locator("h1, [data-test='restaurant-name']")
-        .first()
-        .textContent()
-        .catch(() => "")) || "Unknown Restaurant";
+      (await p.locator("h1").first().textContent().catch(() => "")) ||
+      "Unknown Restaurant";
 
     // If not confirmed, return a preview
     if (!confirm) {
@@ -744,27 +720,32 @@ export async function makeReservation(params: {
       };
     }
 
-    // Find and click the time slot
-    const timeSlot = p
-      .locator(
-        `[data-test="availability-time"]:has-text("${time}"), button[data-datetime*="${time}"], [aria-label*="${time}"]`
-      )
-      .first();
+    // Find and click the requested time slot; slot labels are 12-hour
+    // ("5:00 PM"), the time param is 24-hour ("17:00")
+    // The page renders the slot module twice; only one instance is visible
+    const targetMinutes = timeToMinutes(time);
+    const slotLocator = p.locator('[data-test^="time-slot"]:visible');
+    await slotLocator.first().waitFor({ timeout: 10000 }).catch(() => {});
+    const slotTexts: string[] = await slotLocator.evaluateAll((els) =>
+      els.map((e) => (e.textContent || "").trim())
+    );
+    const matchIndex = slotTexts.findIndex(
+      (t) => timeToMinutes(t) !== null && timeToMinutes(t) === targetMinutes
+    );
 
-    if (await timeSlot.isVisible({ timeout: 5000 })) {
-      await timeSlot.click();
-      await p.waitForTimeout(2000);
+    if (matchIndex >= 0) {
+      await slotLocator.nth(matchIndex).click();
+      await p.waitForTimeout(3000);
+    } else if (slotTexts.length > 0) {
+      return {
+        success: false,
+        error: `The requested time ${time} is not available. Offered slots: ${slotTexts.join(", ")}. Pick one and try again.`,
+      };
     } else {
-      // Try clicking the first available slot
-      const firstSlot = p
-        .locator(
-          '[data-test="availability-time"], [data-testid="time-slot"], button[data-datetime]'
-        )
-        .first();
-      if (await firstSlot.isVisible({ timeout: 5000 })) {
-        await firstSlot.click();
-        await p.waitForTimeout(2000);
-      }
+      return {
+        success: false,
+        error: "No available time slots found for that date and party size.",
+      };
     }
 
     // Fill in special requests if provided
@@ -847,98 +828,72 @@ export async function getReservations(): Promise<{
       return { success: false, error: auth.error };
     }
 
-    await p.goto(`${OPENTABLE_BASE_URL}/account/reservations`, {
+    await p.goto(`${OPENTABLE_BASE_URL}/user/dining-dashboard`, {
       waitUntil: "domcontentloaded",
       timeout: DEFAULT_TIMEOUT,
     });
     await p.waitForTimeout(3000);
 
-    // Wait for reservations to load
     await p
-      .locator(
-        '[data-test="reservation-card"], [data-testid="reservation"], article[data-reservation-id]'
-      )
+      .locator('a[href*="/booking/view"]')
       .first()
       .waitFor({ timeout: 10000 })
       .catch(() => {});
 
-    const reservations: Reservation[] = [];
+    // Reservation cards are links to /booking/view. Cards before the
+    // "Past reservations" heading are upcoming.
+    const reservations: Reservation[] = await p.evaluate(() => {
+      const pastHeading = Array.from(document.querySelectorAll("h2")).find(
+        (h) => /past reservations/i.test(h.textContent || "")
+      );
+      const cards = Array.from(
+        document.querySelectorAll<HTMLAnchorElement>('a[href*="/booking/view"]')
+      );
 
-    const cards = p.locator(
-      '[data-test="reservation-card"], [data-testid="reservation"], article[data-reservation-id]'
-    );
-    const cardCount = await cards.count();
-
-    for (let i = 0; i < Math.min(cardCount, 20); i++) {
-      const card = cards.nth(i);
-
-      try {
-        const restaurantName =
-          (await card
-            .locator(
-              'h2, h3, [data-test="restaurant-name"], a[data-ot-track-component="Restaurant Name"]'
+      return cards
+        .filter(
+          (card) =>
+            !pastHeading ||
+            !!(
+              pastHeading.compareDocumentPosition(card) &
+              Node.DOCUMENT_POSITION_PRECEDING
             )
-            .first()
-            .textContent()
-            .catch(() => "")) || "";
+        )
+        .map((card, i) => {
+          const name = card.querySelector("span")?.textContent?.trim() || "";
+          const status =
+            card
+              .querySelector('[data-test="icSuccess"]')
+              ?.parentElement?.textContent?.trim() || "upcoming";
 
-        const dateText =
-          (await card
-            .locator('[data-test="reservation-date"], time, [datetime]')
-            .first()
-            .textContent()
-            .catch(() => "")) || "";
-
-        const timeText =
-          (await card
-            .locator('[data-test="reservation-time"], [aria-label*="time"]')
-            .first()
-            .textContent()
-            .catch(() => "")) || "";
-
-        const partySizeText =
-          (await card
-            .locator('[data-test="party-size"], [aria-label*="guest"]')
-            .first()
-            .textContent()
-            .catch(() => "")) || "";
-
-        const statusText =
-          (await card
-            .locator('[data-test="reservation-status"], [aria-label*="status"]')
-            .first()
-            .textContent()
-            .catch(() => "upcoming")) || "upcoming";
-
-        const confirmationText =
-          (await card
-            .locator(
-              '[data-test="confirmation-number"], span:has-text("Confirmation")'
-            )
-            .first()
-            .textContent()
-            .catch(() => "")) || "";
-
-        const reservationId =
-          (await card
-            .getAttribute("data-reservation-id")
-            .catch(() => "")) || `res-${i}`;
-
-        if (restaurantName.trim()) {
-          reservations.push({
-            id: reservationId,
-            restaurantName: restaurantName.trim(),
-            date: dateText.trim(),
-            time: timeText.trim(),
-            partySize: parseInt(partySizeText.replace(/[^0-9]/g, "")) || 2,
-            status: statusText.trim(),
-            confirmationNumber: confirmationText.trim() || undefined,
+          // The details span holds the icPerson icon, party size as a text
+          // node, the icCalendar icon, then the date/time as a text node
+          const detailSpan = card.querySelector('[data-test="icPerson"]')
+            ?.parentElement;
+          const textParts: string[] = [];
+          detailSpan?.childNodes.forEach((n) => {
+            if (n.nodeType === Node.TEXT_NODE && n.textContent?.trim()) {
+              textParts.push(n.textContent.trim());
+            }
           });
-        }
-      } catch {
-        // Skip problematic cards
-      }
-    }
+          const dateTime = textParts[1] || "";
+          const [date, time] = dateTime.split(" at ");
+
+          const url = new URL(card.href);
+          const confnumber = url.searchParams.get("confnumber");
+          return {
+            id: confnumber || `res-${i}`,
+            restaurantName: name,
+            date: (date || dateTime).trim(),
+            time: (time || "").trim(),
+            partySize: parseInt(textParts[0] || "") || 0,
+            status,
+            confirmationNumber: confnumber || undefined,
+            manageUrl: url.pathname + url.search,
+          };
+        })
+        .filter((r) => r.restaurantName);
+    });
 
     await saveCookies(ctx);
 
@@ -983,15 +938,25 @@ export async function cancelReservation(params: {
       return { success: false, error: auth.error };
     }
 
-    // Navigate to the reservation page
-    const url = `${OPENTABLE_BASE_URL}/account/reservations/${reservationId}`;
+    // reservationId is the manageUrl (/booking/view?...) from
+    // opentable_get_reservations
+    if (!/booking\/view/.test(reservationId)) {
+      return {
+        success: false,
+        error:
+          "Pass the manageUrl from opentable_get_reservations (a /booking/view?... path) as the reservationId.",
+      };
+    }
+    const url = reservationId.startsWith("http")
+      ? reservationId
+      : `${OPENTABLE_BASE_URL}${reservationId}`;
     await p.goto(url, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
-    await p.waitForTimeout(2000);
+    await p.waitForTimeout(3000);
 
     // Click cancel button
     const cancelButton = p
       .locator(
-        'button:has-text("Cancel reservation"), button:has-text("Cancel"), [data-test="cancel-reservation"]'
+        '[data-test="cancel-reservation"], button:has-text("Cancel reservation"), button:has-text("Cancel")'
       )
       .first();
 
@@ -1028,6 +993,266 @@ export async function cancelReservation(params: {
       success: false,
       error:
         error instanceof Error ? error.message : "Failed to cancel reservation",
+    };
+  }
+}
+
+/**
+ * Convert 24h "HH:MM" to the 12h label OpenTable renders ("6:00 PM")
+ */
+function to12h(t24: string): string | null {
+  const m = timeToMinutes(t24);
+  if (m === null) return null;
+  const h = Math.floor(m / 60);
+  const mins = String(m % 60).padStart(2, "0");
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${mins} ${h < 12 ? "AM" : "PM"}`;
+}
+
+/**
+ * Build the /book/modify URL from a reservation's manageUrl
+ */
+function modifyUrlFromManageUrl(manageUrl: string): string | null {
+  try {
+    const u = new URL(
+      manageUrl.startsWith("http")
+        ? manageUrl
+        : `${OPENTABLE_BASE_URL}${manageUrl}`
+    );
+    const rid = u.searchParams.get("rid");
+    const conf =
+      u.searchParams.get("confnumber") ||
+      u.searchParams.get("confirmationNumber");
+    const token =
+      u.searchParams.get("token") || u.searchParams.get("securityToken");
+    if (!rid || !conf || !token) return null;
+    return `${OPENTABLE_BASE_URL}/book/modify?rid=${rid}&confirmationNumber=${conf}&securityToken=${encodeURIComponent(token)}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Open the modify flow for an existing reservation, request the desired
+ * time/party size, and collect the offered slot times. Modify-flow inventory
+ * can differ from the new-reservation flow (the diner's own table is
+ * released back into it), so availability must be checked here, not on the
+ * restaurant profile page.
+ */
+async function openModifyFlowAndGetSlots(params: {
+  reservationUrl: string;
+  time: string;
+  partySize?: number;
+}): Promise<{
+  page: Page;
+  currentReservation: string;
+  slotTimes: string[];
+  error?: string;
+}> {
+  const p = await getPage();
+  const { reservationUrl, time, partySize } = params;
+
+  const modifyUrl = modifyUrlFromManageUrl(reservationUrl);
+  if (!modifyUrl) {
+    throw new Error(
+      "reservationUrl must be the manageUrl from opentable_get_reservations (a /booking/view?... path with rid, confnumber, and token)."
+    );
+  }
+
+  await p.goto(modifyUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: DEFAULT_TIMEOUT,
+  });
+  await p.waitForTimeout(3000);
+
+  const bodyText = (
+    (await p.locator("body").textContent().catch(() => "")) || ""
+  ).replace(/\s+/g, " ");
+  const currentReservation =
+    bodyText.match(
+      /Your current reservation\s*(.*?)\s*Modify your reservation/
+    )?.[1] || "";
+
+  await p.locator("#time-picker").waitFor({ timeout: 10000 });
+  await p.locator("#time-picker").selectOption(`2000-02-01T${time}:00`);
+  if (partySize) {
+    await p
+      .locator("#party-size-picker")
+      .selectOption(String(partySize))
+      .catch(() => {});
+  }
+  await p.waitForTimeout(500);
+  await p.locator('[data-test="dtpPicker-submit"]').click();
+  await p.waitForTimeout(5000);
+
+  // Offered slots render as plain buttons whose text is a time, repeated
+  // per dining area; dedupe and sort
+  const slotTexts: string[] = await p
+    .locator("button:visible")
+    .evaluateAll((els) =>
+      els
+        .map((e) => (e.textContent || "").trim())
+        .filter((t) => /^\d{1,2}:\d{2}\s*(AM|PM)$/i.test(t))
+    );
+  const slotTimes = [...new Set(slotTexts)].sort(
+    (a, b) => (timeToMinutes(a) ?? 0) - (timeToMinutes(b) ?? 0)
+  );
+
+  return { page: p, currentReservation, slotTimes };
+}
+
+/**
+ * Check what times the modify flow offers for an existing reservation
+ */
+export async function checkModifyAvailability(params: {
+  reservationUrl: string;
+  time: string;
+  partySize?: number;
+  earliestTime?: string;
+  latestTime?: string;
+}): Promise<{
+  success: boolean;
+  currentReservation?: string;
+  slots?: string[];
+  allOffered?: string[];
+  error?: string;
+}> {
+  const ctx = await getContext();
+
+  try {
+    const auth = await ensureLoggedIn();
+    if (!auth.loggedIn) {
+      return { success: false, error: auth.error };
+    }
+
+    const { currentReservation, slotTimes } = await openModifyFlowAndGetSlots(
+      params
+    );
+
+    const earliest = params.earliestTime
+      ? timeToMinutes(params.earliestTime)
+      : null;
+    const latest = params.latestTime ? timeToMinutes(params.latestTime) : null;
+    const slots = slotTimes.filter((t) => {
+      const m = timeToMinutes(t);
+      if (m === null) return false;
+      if (earliest !== null && m < earliest) return false;
+      if (latest !== null && m > latest) return false;
+      return true;
+    });
+
+    await saveCookies(ctx);
+    return {
+      success: true,
+      currentReservation: currentReservation.trim() || undefined,
+      slots,
+      allOffered: slotTimes,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Failed to check modify availability",
+    };
+  }
+}
+
+/**
+ * Modify an existing reservation to a new time (same date) via the modify
+ * flow. With confirm=false, previews the offered times without changing
+ * anything.
+ */
+export async function modifyReservation(params: {
+  reservationUrl: string;
+  newTime: string;
+  partySize?: number;
+  confirm: boolean;
+}): Promise<{
+  success: boolean;
+  requiresConfirmation?: boolean;
+  message?: string;
+  offeredTimes?: string[];
+  error?: string;
+}> {
+  const ctx = await getContext();
+
+  try {
+    const auth = await ensureLoggedIn();
+    if (!auth.loggedIn) {
+      return { success: false, error: auth.error };
+    }
+
+    const target12h = to12h(params.newTime);
+    if (!target12h) {
+      return {
+        success: false,
+        error: `Could not parse newTime "${params.newTime}" — use HH:MM (24h).`,
+      };
+    }
+
+    const { page: p, slotTimes } = await openModifyFlowAndGetSlots({
+      reservationUrl: params.reservationUrl,
+      time: params.newTime,
+      partySize: params.partySize,
+    });
+
+    if (!slotTimes.includes(target12h)) {
+      return {
+        success: false,
+        offeredTimes: slotTimes,
+        error: `${target12h} is not offered in the modify flow right now. Offered: ${slotTimes.join(", ") || "none"}.`,
+      };
+    }
+
+    if (!params.confirm) {
+      return {
+        success: true,
+        requiresConfirmation: true,
+        offeredTimes: slotTimes,
+        message: `${target12h} is available. Set confirm=true to move the reservation.`,
+      };
+    }
+
+    // Take the slot, then complete whatever confirmation step follows
+    await p
+      .locator("button:visible")
+      .filter({ hasText: new RegExp(`^${target12h.replace(/[:\s]/g, "\\$&")}$`) })
+      .first()
+      .click();
+    await p.waitForTimeout(4000);
+
+    const confirmButton = p
+      .locator(
+        '[data-test*="confirm"], button:has-text("Confirm"), button:has-text("Complete"), button[type="submit"]'
+      )
+      .locator("visible=true")
+      .first();
+    if (await confirmButton.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await confirmButton.click();
+      await p.waitForTimeout(5000);
+    }
+
+    const bodyText =
+      ((await p.locator("body").textContent().catch(() => "")) || "").replace(
+        /\s+/g,
+        " "
+      );
+    const succeeded = /reservation (confirmed|modified|updated)/i.test(bodyText);
+
+    await saveCookies(ctx);
+    return {
+      success: succeeded,
+      message: succeeded
+        ? `Reservation moved to ${target12h}.`
+        : `Clicked ${target12h} and submitted, but could not verify the change — check the reservation with opentable_get_reservations. Page said: ${bodyText.slice(0, 300)}`,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error:
+        error instanceof Error ? error.message : "Failed to modify reservation",
     };
   }
 }
