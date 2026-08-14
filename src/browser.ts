@@ -1047,6 +1047,7 @@ async function openModifyFlowAndGetSlots(params: {
   page: Page;
   currentReservation: string;
   slotTimes: string[];
+  otherDays: { day: string; times: string[] }[];
   error?: string;
 }> {
   const p = await getPage();
@@ -1085,20 +1086,68 @@ async function openModifyFlowAndGetSlots(params: {
   await p.locator('[data-test="dtpPicker-submit"]').click();
   await p.waitForTimeout(5000);
 
-  // Offered slots render as plain buttons whose text is a time, repeated
-  // per dining area; dedupe and sort
-  const slotTexts: string[] = await p
-    .locator("button:visible")
-    .evaluateAll((els) =>
-      els
-        .map((e) => (e.textContent || "").trim())
-        .filter((t) => /^\d{1,2}:\d{2}\s*(AM|PM)$/i.test(t))
+  // Same-date slots are the button row above the "Similar times based on
+  // your original reservation" heading; buttons under it belong to OTHER
+  // days and must not be reported as same-day availability.
+  const extracted = await p.evaluate(() => {
+    const isTime = (t: string) => /^\d{1,2}:\d{2}\s*(AM|PM)$/i.test(t);
+    const heading = Array.from(
+      document.querySelectorAll("h1, h2, h3, div, p, span")
+    ).find((el) => {
+      const t = (el.textContent || "").trim();
+      return /similar times based on your original reservation/i.test(t) &&
+        t.length < 80;
+    });
+
+    const timeButtons = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("button")
+    ).filter(
+      (b) =>
+        isTime((b.textContent || "").trim()) &&
+        !b.disabled &&
+        b.offsetParent !== null
     );
-  const slotTimes = [...new Set(slotTexts)].sort(
+
+    const sameDay = timeButtons
+      .filter(
+        (b) =>
+          !heading ||
+          !!(
+            heading.compareDocumentPosition(b) &
+            Node.DOCUMENT_POSITION_PRECEDING
+          )
+      )
+      .map((b) => (b.textContent || "").trim());
+
+    // Parse the other-day suggestions ("Monday, Aug 24  4:30 PM 5:00 PM …")
+    const otherDays: { day: string; times: string[] }[] = [];
+    if (heading) {
+      const container = heading.parentElement;
+      const text = (container?.textContent || "").replace(/\s+/g, " ");
+      const rowRe =
+        /([A-Z][a-z]+day, [A-Z][a-z]+ \d+)((?:\s*\d{1,2}:\d{2} [AP]M)+)/g;
+      let m;
+      while ((m = rowRe.exec(text))) {
+        otherDays.push({
+          day: m[1],
+          times: m[2].match(/\d{1,2}:\d{2} [AP]M/g) || [],
+        });
+      }
+    }
+
+    return { sameDay, otherDays };
+  });
+
+  const slotTimes = [...new Set(extracted.sameDay)].sort(
     (a, b) => (timeToMinutes(a) ?? 0) - (timeToMinutes(b) ?? 0)
   );
 
-  return { page: p, currentReservation, slotTimes };
+  return {
+    page: p,
+    currentReservation,
+    slotTimes,
+    otherDays: extracted.otherDays,
+  };
 }
 
 /**
@@ -1113,8 +1162,9 @@ export async function checkModifyAvailability(params: {
 }): Promise<{
   success: boolean;
   currentReservation?: string;
-  slots?: string[];
-  allOffered?: string[];
+  sameDaySlotsInWindow?: string[];
+  allSameDaySlots?: string[];
+  otherDaySuggestions?: { day: string; times: string[] }[];
   error?: string;
 }> {
   const ctx = await getContext();
@@ -1125,9 +1175,8 @@ export async function checkModifyAvailability(params: {
       return { success: false, error: auth.error };
     }
 
-    const { currentReservation, slotTimes } = await openModifyFlowAndGetSlots(
-      params
-    );
+    const { currentReservation, slotTimes, otherDays } =
+      await openModifyFlowAndGetSlots(params);
 
     const earliest = params.earliestTime
       ? timeToMinutes(params.earliestTime)
@@ -1145,8 +1194,9 @@ export async function checkModifyAvailability(params: {
     return {
       success: true,
       currentReservation: currentReservation.trim() || undefined,
-      slots,
-      allOffered: slotTimes,
+      sameDaySlotsInWindow: slots,
+      allSameDaySlots: slotTimes,
+      otherDaySuggestions: otherDays,
     };
   } catch (error) {
     return {

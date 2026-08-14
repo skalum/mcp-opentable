@@ -218,7 +218,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "opentable_check_modify_availability",
         description:
-          "Check what alternative times are available for an EXISTING reservation via OpenTable's modify flow (same date). Use this — not opentable_check_availability — when looking to move an existing reservation: the modify flow often offers times the new-reservation flow does not. Optionally filter to a time window.",
+          "Check what alternative times are available for an EXISTING reservation via OpenTable's modify flow. Use this — not opentable_check_availability — when looking to move an existing reservation. Returns sameDaySlotsInWindow / allSameDaySlots for the reservation's own date, plus otherDaySuggestions (times OpenTable offers on nearby OTHER days — do not confuse these with same-day availability). Optionally filter to a time window.",
         inputSchema: {
           type: "object",
           properties: {

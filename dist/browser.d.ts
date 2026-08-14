@@ -172,8 +172,12 @@ export declare function checkModifyAvailability(params: {
 }): Promise<{
     success: boolean;
     currentReservation?: string;
-    slots?: string[];
-    allOffered?: string[];
+    sameDaySlotsInWindow?: string[];
+    allSameDaySlots?: string[];
+    otherDaySuggestions?: {
+        day: string;
+        times: string[];
+    }[];
     error?: string;
 }>;
 /**
